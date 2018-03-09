@@ -14,11 +14,11 @@ avg_param_interval=50
 shared_file=file://$HOME/shared_file
 
 # training parameters
-epoch=20
+epoch=1
 batch_size=20
 bptt=35
 nhid=300
-data=$HOME/data/wikitext-2
+data=$HOME/dataset/wikitext-2
 model=LSTM
 emsize=200
 nlayers=2
@@ -31,7 +31,7 @@ save=model.pt
 
 # training on single GPU
 if [ "$is_distributed" != "True" ]; then
-    python3 main.py --data ${data} --model ${model} --emsize ${emsize} --nlayers ${nlayers} --lr ${lr} --clip ${clip} --dropout ${dropout} --seed ${seed} --log-interval ${log_interval} --save ${save} --nhid ${nhid} --epoch ${epoch} --batch_size ${batch_size} --bptt ${bptt} --cuda
+    python3 -u main.py --data ${data} --model ${model} --emsize ${emsize} --nlayers ${nlayers} --lr ${lr} --clip ${clip} --dropout ${dropout} --seed ${seed} --log-interval ${log_interval} --save ${save} --nhid ${nhid} --epoch ${epoch} --batch_size ${batch_size} --bptt ${bptt} --cuda
     exit 0
 fi
 
@@ -46,8 +46,8 @@ gpu_num=${#device_list[@]}
 i=0
 while [ "${rank}" != "$(($world_size-1))" -a "${i}" != "$((gpu_num-1))" ]
 do
-    python3 main.py --data ${data} --model ${model} --emsize ${emsize} --nlayers ${nlayers} --lr ${lr} --clip ${clip} --dropout ${dropout} --seed ${seed} --log-interval ${log_interval} --save ${save} --nhid ${nhid} --epoch ${epoch} --batch_size ${batch_size} --bptt ${bptt} --device ${device_list[$i]} --rank ${rank} --world_size ${world_size} --shared_file ${shared_file} --distributed --cuda &
+    python3 -u main.py --data ${data} --model ${model} --emsize ${emsize} --nlayers ${nlayers} --lr ${lr} --clip ${clip} --dropout ${dropout} --seed ${seed} --log-interval ${log_interval} --save ${save} --nhid ${nhid} --epoch ${epoch} --batch_size ${batch_size} --bptt ${bptt} --device ${device_list[$i]} --rank ${rank} --world_size ${world_size} --shared_file ${shared_file} --distributed --cuda &
     rank=$(($rank+1))
     i=$(($i+1))
 done
-python3 main.py --data ${data} --model ${model} --emsize ${emsize} --nlayers ${nlayers} --lr ${lr} --clip ${clip} --dropout ${dropout} --seed ${seed} --log-interval ${log_interval} --save ${save} --nhid ${nhid} --epoch ${epoch} --batch_size ${batch_size} --bptt ${bptt} --device ${device_list[$i]} --rank ${rank} --world_size ${world_size} --shared_file ${shared_file} --distributed --cuda
+python3 -u main.py --data ${data} --model ${model} --emsize ${emsize} --nlayers ${nlayers} --lr ${lr} --clip ${clip} --dropout ${dropout} --seed ${seed} --log-interval ${log_interval} --save ${save} --nhid ${nhid} --epoch ${epoch} --batch_size ${batch_size} --bptt ${bptt} --device ${device_list[$i]} --rank ${rank} --world_size ${world_size} --shared_file ${shared_file} --distributed --cuda
