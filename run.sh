@@ -30,7 +30,7 @@ save=model.pt
 
 # training on single GPU
 if [ "$is_distributed" != "True" ]; then
-    python3 main.py --data ${data} --model ${model} --emsize ${emsize} --nlayers ${nlayers} --lr ${lr} --clip ${clip} --dropout ${dropout} --seed ${seed} --log-interval ${log_interval} --save ${save} --nhid ${nhid} --epoch ${epoch} --batch_size ${batch_size} --bptt ${bptt} --cuda
+    python3 -u main.py --data ${data} --model ${model} --emsize ${emsize} --nlayers ${nlayers} --lr ${lr} --clip ${clip} --dropout ${dropout} --seed ${seed} --log-interval ${log_interval} --save ${save} --nhid ${nhid} --epoch ${epoch} --batch_size ${batch_size} --bptt ${bptt} --cuda
     exit 0
 fi
 
