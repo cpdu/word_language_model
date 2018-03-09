@@ -1,0 +1,1 @@
+This is a distributed version of [pytorch official language model example](https://github.com/pytorch/examples/tree/master/word_language_model) for multiple GPUs and multiple machines using model averaging algorithm. You can set your parameters in run.sh. Execute run.sh to start your training.

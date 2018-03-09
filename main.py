@@ -1,16 +1,23 @@
 # coding: utf-8
 import argparse
-import time
 import math
+import os
+from multiprocessing import Process
+import time
+
 import torch
 import torch.nn as nn
 from torch.autograd import Variable
+from torch.utils.data.dataloader import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
 
 import data
-import model
+from model import RNNModel
+from loader import TextDataset
 
 parser = argparse.ArgumentParser(description='PyTorch Wikitext-2 RNN/LSTM Language Model')
-parser.add_argument('--data', type=str, default='./data/wikitext-2',
+parser.add_argument('--data', type=str, default='./data/ptb',
                     help='location of the data corpus')
 parser.add_argument('--model', type=str, default='LSTM',
                     help='type of recurrent net (RNN_TANH, RNN_RELU, LSTM, GRU)')
@@ -42,21 +49,23 @@ parser.add_argument('--log-interval', type=int, default=200, metavar='N',
                     help='report interval')
 parser.add_argument('--save', type=str,  default='model.pt',
                     help='path to save the final model')
+parser.add_argument('--world_size', type=int, default=0)
+parser.add_argument('--rank', type=int, default=-1)
+parser.add_argument('--device', type=str, default='0')
+parser.add_argument('--shared_file', type=str, default="file://"+os.environ['HOME']+"/shared_file")
+parser.add_argument('--distributed', action='store_true')
+parser.add_argument('--avg_param_interval', type=int, default=50,
+                    help='model averaging interval')
 args = parser.parse_args()
 
-# Set the random seed manually for reproducibility.
-torch.manual_seed(args.seed)
-if torch.cuda.is_available():
-    if not args.cuda:
-        print("WARNING: You have a CUDA device, so you should probably run with --cuda")
-    else:
-        torch.cuda.manual_seed(args.seed)
+
 
 ###############################################################################
 # Load data
 ###############################################################################
 
 corpus = data.Corpus(args.data)
+ntokens = len(corpus.dictionary)
 
 # Starting from sequential data, batchify arranges the dataset into columns.
 # For instance, with the alphabet as the sequence and batch size 4, we'd get
@@ -69,7 +78,6 @@ corpus = data.Corpus(args.data)
 # These columns are treated as independent by the model, which means that the
 # dependence of e. g. 'g' on 'f' can not be learned, but allows more efficient
 # batch processing.
-
 def batchify(data, bsz):
     # Work out how cleanly we can divide the dataset into bsz parts.
     nbatch = data.size(0) // bsz
@@ -80,22 +88,6 @@ def batchify(data, bsz):
     if args.cuda:
         data = data.cuda()
     return data
-
-eval_batch_size = 10
-train_data = batchify(corpus.train, args.batch_size)
-val_data = batchify(corpus.valid, eval_batch_size)
-test_data = batchify(corpus.test, eval_batch_size)
-
-###############################################################################
-# Build the model
-###############################################################################
-
-ntokens = len(corpus.dictionary)
-model = model.RNNModel(args.model, ntokens, args.emsize, args.nhid, args.nlayers, args.dropout, args.tied)
-if args.cuda:
-    model.cuda()
-
-criterion = nn.CrossEntropyLoss()
 
 ###############################################################################
 # Training code
@@ -118,15 +110,63 @@ def repackage_hidden(h):
 # done along the batch dimension (i.e. dimension 1), since that was handled
 # by the batchify function. The chunks are along dimension 0, corresponding
 # to the seq_len dimension in the LSTM.
-
 def get_batch(source, i, evaluation=False):
     seq_len = min(args.bptt, len(source) - 1 - i)
     data = Variable(source[i:i+seq_len], volatile=evaluation)
     target = Variable(source[i+1:i+1+seq_len].view(-1))
     return data, target
 
+def average_model(model):
+    for param in model.parameters():
+        dist.all_reduce(param.data, op=dist.reduce_op.SUM)
+        param.data /= float(dist.get_world_size())
 
-def evaluate(data_source):
+def train(model, dataloader, criterion, lr, epoch):
+    # Turn on training mode which enables dropout.
+    model.train()
+    total_loss = 0
+    start_time = time.time()
+    ntokens = len(corpus.dictionary)
+    for batch, data in enumerate(dataloader):
+        targets = data[1].t().contiguous().view(-1)
+        data = data[0].t().contiguous()
+        if args.cuda:
+            data = data.cuda()
+            targets = targets.cuda()
+        data = Variable(data)
+        targets = Variable(targets)
+
+        # Starting each batch, we detach the hidden state from how it was previously produced.
+        # If we didn't, the model would try backpropagating all the way to start of the dataset.
+        hidden = model.init_hidden(args.batch_size)
+
+        model.zero_grad()
+        output, hidden = model(data, hidden)
+        loss = criterion(output.view(-1, ntokens), targets)
+        loss.backward()
+        total_loss += loss.data
+
+        # `clip_grad_norm` helps prevent the exploding gradient problem in RNNs / LSTMs.
+        torch.nn.utils.clip_grad_norm(model.parameters(), args.clip)
+        for p in model.parameters():
+            p.data.add_(-lr, p.grad.data)
+
+        if args.distributed and batch % args.avg_param_interval == 0 and batch > 0:
+            average_model(model)
+
+        if batch % args.log_interval == 0 and batch > 0:
+            world_size = 1 if not args.distributed else dist.get_world_size()
+            if (not args.distributed) or dist.get_rank() == world_size - 1:
+                cur_loss = total_loss[0] / args.log_interval
+                elapsed = time.time() - start_time
+                print('| epoch {:3d} | {:5d}/{:5d} batches | lr {:02.2f} | ms/batch {:5.2f} | '
+                      'loss {:5.2f} | ppl {:8.2f}'.format(
+                    epoch, batch * world_size, len(corpus.train) // args.batch_size // args.bptt, lr,
+                                  elapsed * 1000 / args.log_interval, cur_loss, math.exp(cur_loss)))
+                total_loss = 0
+                start_time = time.time()
+
+def evaluate(model, criterion, eval_batch_size, data_source):
     # Turn on evaluation mode which disables dropout.
     model.eval()
     total_loss = 0
@@ -140,75 +180,97 @@ def evaluate(data_source):
         hidden = repackage_hidden(hidden)
     return total_loss[0] / len(data_source)
 
-
-def train():
-    # Turn on training mode which enables dropout.
-    model.train()
-    total_loss = 0
-    start_time = time.time()
-    ntokens = len(corpus.dictionary)
-    hidden = model.init_hidden(args.batch_size)
-    for batch, i in enumerate(range(0, train_data.size(0) - 1, args.bptt)):
-        data, targets = get_batch(train_data, i)
-        # Starting each batch, we detach the hidden state from how it was previously produced.
-        # If we didn't, the model would try backpropagating all the way to start of the dataset.
-        hidden = repackage_hidden(hidden)
-        model.zero_grad()
-        output, hidden = model(data, hidden)
-        loss = criterion(output.view(-1, ntokens), targets)
-        loss.backward()
-
-        # `clip_grad_norm` helps prevent the exploding gradient problem in RNNs / LSTMs.
-        torch.nn.utils.clip_grad_norm(model.parameters(), args.clip)
-        for p in model.parameters():
-            p.data.add_(-lr, p.grad.data)
-
-        total_loss += loss.data
-
-        if batch % args.log_interval == 0 and batch > 0:
-            cur_loss = total_loss[0] / args.log_interval
-            elapsed = time.time() - start_time
-            print('| epoch {:3d} | {:5d}/{:5d} batches | lr {:02.2f} | ms/batch {:5.2f} | '
-                    'loss {:5.2f} | ppl {:8.2f}'.format(
-                epoch, batch, len(train_data) // args.bptt, lr,
-                elapsed * 1000 / args.log_interval, cur_loss, math.exp(cur_loss)))
-            total_loss = 0
-            start_time = time.time()
-
-# Loop over epochs.
-lr = args.lr
-best_val_loss = None
-
-# At any point you can hit Ctrl + C to break out of training early.
-try:
-    for epoch in range(1, args.epochs+1):
-        epoch_start_time = time.time()
-        train()
-        val_loss = evaluate(val_data)
-        print('-' * 89)
-        print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | '
-                'valid ppl {:8.2f}'.format(epoch, (time.time() - epoch_start_time),
-                                           val_loss, math.exp(val_loss)))
-        print('-' * 89)
-        # Save the model if the validation loss is the best we've seen so far.
-        if not best_val_loss or val_loss < best_val_loss:
-            with open(args.save, 'wb') as f:
-                torch.save(model, f)
-            best_val_loss = val_loss
+def main():
+    # Set the random seed manually for reproducibility.
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        if not args.cuda:
+            print("WARNING: You have a CUDA device, so you should probably run with --cuda")
         else:
-            # Anneal the learning rate if no improvement has been seen in the validation dataset.
-            lr /= 4.0
-except KeyboardInterrupt:
-    print('-' * 89)
-    print('Exiting from training early')
+            torch.cuda.manual_seed(args.seed)
 
-# Load the best saved model.
-with open(args.save, 'rb') as f:
-    model = torch.load(f)
+    # construct training dataloader
+    dataset = TextDataset(corpus.train, args.bptt)
+    if args.distributed:
+        dsampler = DistributedSampler(dataset)
+        dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler=dsampler, drop_last=True)
+    else:
+        dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
 
-# Run on test data.
-test_loss = evaluate(test_data)
-print('=' * 89)
-print('| End of training | test loss {:5.2f} | test ppl {:8.2f}'.format(
-    test_loss, math.exp(test_loss)))
-print('=' * 89)
+    eval_batch_size = 10
+    val_data = batchify(corpus.valid, eval_batch_size)
+    test_data = batchify(corpus.test, eval_batch_size)
+
+    # construct model
+    model = RNNModel(args.model, ntokens, args.emsize, args.nhid, args.nlayers, args.dropout, args.tied)
+    if args.cuda:
+        model.cuda()
+
+    criterion = nn.CrossEntropyLoss()
+    lr = args.lr
+
+    # Loop over epochs.
+    # At any point you can hit Ctrl + C to break out of training early.
+    best_val_loss = None
+    try:
+        for epoch in range(1, args.epochs + 1):
+
+            epoch_start_time = time.time()
+            train(model, dataloader, criterion, lr, epoch)
+            train_end_time = time.time()
+
+            if (not args.distributed) or dist.get_rank() == dist.get_world_size() - 1:
+                val_loss = evaluate(model, criterion, eval_batch_size, val_data)
+                print('-' * 89)
+                print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | '
+                      'valid ppl {:8.2f}'.format(epoch, (train_end_time - epoch_start_time),
+                                                 val_loss, math.exp(val_loss)))
+                print('-' * 89)
+
+            # Save the model if the validation loss is the best we've seen so far.
+            if not best_val_loss or val_loss < best_val_loss:
+                if (not args.distributed) or dist.get_rank() == dist.get_world_size() - 1:
+                    with open(args.save, 'wb') as f:
+                        torch.save(model, f)
+                    best_val_loss = val_loss
+            else:
+                # Anneal the learning rate if no improvement has been seen in the validation dataset.
+                lr /= 4.0
+
+    except KeyboardInterrupt:
+        if (not args.distributed) or dist.get_rank() == dist.get_world_size() - 1:
+            print('-' * 89)
+            print('Exiting from training early')
+
+    # Load the best saved model.
+    if (not args.distributed) or dist.get_rank() == dist.get_world_size() - 1:
+        with open(args.save, 'rb') as f:
+            model = torch.load(f)
+
+        # Run on test data.
+        test_loss = evaluate(model, criterion, eval_batch_size, test_data)
+        print('=' * 89)
+        print('| End of training | test loss {:5.2f} | test ppl {:8.2f}'.format(
+            test_loss, math.exp(test_loss)))
+        print('=' * 89)
+
+def init_processes(rank, size, func, backend='gloo'):
+    """ Initialize the distributed environment. """
+    os.environ['CUDA_VISIBLE_DEVICES'] = args.device
+    dist.init_process_group(backend, rank=rank, world_size=size, init_method=args.shared_file)
+    func()
+
+
+if __name__ == "__main__":
+    if args.distributed:
+        if args.batch_size % args.world_size != 0:
+            print("\nError: batch_size must be an integer multiple of world_size.\n")
+            exit(1)
+        if args.world_size < 2:
+            print("\nError: world_size should be greater than 1 in distributed mode.\n")
+            exit(2)
+        p = Process(target=init_processes, args=(args.rank, args.world_size, main))
+        p.start()
+        p.join()
+    else:
+        main()
