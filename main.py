@@ -208,11 +208,13 @@ def main():
     best_val_loss = None
     try:
         for epoch in range(1, args.epochs + 1):
+
             epoch_start_time = time.time()
             train(model, dataloader, criterion, lr, epoch)
-            val_loss = evaluate(model, criterion, eval_batch_size, val_data)
+            train_end_time = time.time()
 
             if (not args.distributed) or dist.get_rank() == dist.get_world_size() - 1:
+                val_loss = evaluate(model, criterion, eval_batch_size, val_data)
                 print('-' * 89)
                 print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | '
                       'valid ppl {:8.2f}'.format(epoch, (time.time() - epoch_start_time),
